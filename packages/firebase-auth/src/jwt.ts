@@ -1,5 +1,9 @@
-import { decodeProtectedHeader, importX509, jwtVerify } from "jose";
 import { JwtDecodeError } from "./error";
+import type { JwtDecodeErrorCode } from "./error";
+import { getGooglePublicKeys } from "./fetch-google-public-keys";
+import type { PublicKeysFetcher, VerificationKeys } from "./fetch-google-public-keys";
+import { decodeProtectedHeader, importX509, jwtVerify } from "jose";
+import type { KeyLike } from "jose";
 
 export interface DecodedIdToken {
   /**
@@ -143,35 +147,157 @@ export interface DecodedIdToken {
   [key: string]: any;
 }
 
+export type VerifyJwtOptions = {
+  /**
+   * Seconds of clock skew to allow when checking `exp`, `iat` and `auth_time`.
+   * @default 5
+   */
+  clockTolerance?: number;
+};
+
+export type VerifyIdTokenOptions = VerifyJwtOptions & {
+  projectId: string;
+  /**
+   * Where to get Google's public keys. Defaults to `getGooglePublicKeys`, which
+   * caches them. Tests can pass a function that returns their own keys.
+   */
+  fetchPublicKeys?: PublicKeysFetcher;
+};
+
+const DEFAULT_CLOCK_TOLERANCE_SECONDS = 5;
+const MAX_UID_LENGTH = 128;
+const MAX_IMPORTED_KEYS = 16;
+
+// Google rotates a handful of keys, so caching the imported form saves an
+// X.509 parse on every request.
+const importedKeys = new Map<string, Promise<KeyLike>>();
+
+const importVerificationKey = (key: string | KeyLike): Promise<KeyLike> => {
+  if (typeof key !== "string") {
+    return Promise.resolve(key);
+  }
+  let imported = importedKeys.get(key);
+  if (!imported) {
+    if (importedKeys.size >= MAX_IMPORTED_KEYS) {
+      importedKeys.clear();
+    }
+    imported = importX509(key, "RS256");
+    importedKeys.set(key, imported);
+    imported.catch(() => importedKeys.delete(key));
+  }
+  return imported;
+};
+
+const readKid = (jwtToken: string): string => {
+  let kid: string | undefined;
+  try {
+    kid = decodeProtectedHeader(jwtToken).kid;
+  } catch {
+    throw new JwtDecodeError("invalid jwt: cannot decode the protected header", "malformed");
+  }
+  if (!kid) {
+    throw new JwtDecodeError("invalid jwt header does not contain kid", "malformed");
+  }
+  return kid;
+};
+
+const joseErrorCodes: Record<string, JwtDecodeErrorCode> = {
+  ERR_JWT_EXPIRED: "expired",
+  ERR_JWT_CLAIM_VALIDATION_FAILED: "invalid_claims",
+  ERR_JWS_SIGNATURE_VERIFICATION_FAILED: "invalid_signature",
+  ERR_JOSE_ALG_NOT_ALLOWED: "invalid_signature",
+  ERR_JWS_INVALID: "malformed",
+  ERR_JWT_INVALID: "malformed",
+};
+
+const toJwtDecodeError = (e: unknown): JwtDecodeError => {
+  if (e instanceof JwtDecodeError) {
+    return e;
+  }
+  const joseCode = (e as { code?: string } | undefined)?.code;
+  const code = joseCode ? joseErrorCodes[joseCode] : undefined;
+  if (code) {
+    return new JwtDecodeError((e as Error).message, code);
+  }
+  // Not an expected rejection, so keep the details for debugging.
+  console.error(e);
+  return new JwtDecodeError("uncaught jwt decode exception", "malformed");
+};
+
+// Firebase rules that jwtVerify does not cover:
+// https://firebase.google.com/docs/auth/admin/verify-id-tokens#verify_id_tokens_using_a_third-party_jwt_library
+const assertFirebaseClaims = (payload: Record<string, unknown>, clockTolerance: number) => {
+  const now = Math.floor(Date.now() / 1000) + clockTolerance;
+  const { sub, iat, auth_time: authTime } = payload;
+  if (typeof sub !== "string" || sub.length === 0 || sub.length > MAX_UID_LENGTH) {
+    throw new JwtDecodeError(
+      `"sub" claim must be a non-empty string of at most ${MAX_UID_LENGTH} characters`,
+      "invalid_claims",
+    );
+  }
+  if (typeof iat !== "number" || iat > now) {
+    throw new JwtDecodeError('"iat" claim must be in the past', "invalid_claims");
+  }
+  if (typeof authTime !== "number" || authTime > now) {
+    throw new JwtDecodeError('"auth_time" claim must be in the past', "invalid_claims");
+  }
+};
+
+/**
+ * Verifies a Firebase ID token against a known set of public keys.
+ *
+ * Throws `JwtDecodeError` with a `code` that says why the token was rejected.
+ * Most callers should use `verifyIdToken`, which also fetches and caches keys.
+ */
 export const verifyAndDecodeJwt = async (
   jwtToken: string,
-  publicKeys: Record<string, string>,
-  projectId: string
+  publicKeys: VerificationKeys,
+  projectId: string,
+  options: VerifyJwtOptions = {},
 ): Promise<DecodedIdToken> => {
+  const clockTolerance = options.clockTolerance ?? DEFAULT_CLOCK_TOLERANCE_SECONDS;
   try {
-    const { kid } = await decodeProtectedHeader(jwtToken);
-    if (!kid) {
-      throw new TypeError("invalid jwt header does not contain kid");
-    }
-    if (!publicKeys[kid]) {
-      throw new TypeError(
-        "invalid kid or google public key has been updated recently"
+    const kid = readKid(jwtToken);
+    const key = publicKeys[kid];
+    if (!key) {
+      throw new JwtDecodeError(
+        "invalid kid or google public key has been updated recently",
+        "unknown_key",
       );
     }
-    const x509 = publicKeys[kid];
-    const publicKey = await importX509(x509, "RS256");
+    const publicKey = await importVerificationKey(key);
     const { payload } = await jwtVerify(jwtToken, publicKey, {
+      algorithms: ["RS256"],
       audience: projectId,
       issuer: `https://securetoken.google.com/${projectId}`,
+      clockTolerance,
     });
+    assertFirebaseClaims(payload, clockTolerance);
 
-    return payload as DecodedIdToken;
+    return { ...payload, uid: payload.sub } as DecodedIdToken;
   } catch (e: unknown) {
-    if (e instanceof TypeError) {
-      throw new JwtDecodeError(e.message);
-    } else {
-      console.error(e);
-      throw new JwtDecodeError("uncaught jwt decode exception");
-    }
+    throw toJwtDecodeError(e);
   }
+};
+
+/**
+ * Verifies a Firebase ID token, fetching Google's public keys as needed.
+ *
+ * Keys are cached. When the token's `kid` is not in the cache, the keys are
+ * fetched again once, because Google rotates them.
+ */
+export const verifyIdToken = async (
+  jwtToken: string,
+  options: VerifyIdTokenOptions,
+): Promise<DecodedIdToken> => {
+  if (!options.projectId) {
+    throw new Error("verifyIdToken: projectId is required");
+  }
+  const fetchPublicKeys = options.fetchPublicKeys ?? getGooglePublicKeys;
+  const kid = readKid(jwtToken);
+  let publicKeys = await fetchPublicKeys();
+  if (!publicKeys[kid]) {
+    publicKeys = await fetchPublicKeys({ forceRefresh: true });
+  }
+  return verifyAndDecodeJwt(jwtToken, publicKeys, options.projectId, options);
 };
