@@ -48,10 +48,10 @@
   "author": "Hieu Tran <hieutran.fu@gmail.com>",
   "license": "MIT",
   "devDependencies": {
-    "hono": "^3.12.12"
+    "hono": "^4.10.7"
   },
   "peerDependencies": {
-    "hono": "^3.12.12"
+    "hono": "^4.0.0"
   },
   "dependencies": {
     "@fiboup/firebase-auth": "workspace:^1.0.3"
